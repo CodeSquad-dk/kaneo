@@ -1,0 +1,91 @@
+name: Fork Deploy
+
+on:
+  push:
+    branches: [deploy]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing image tag to (re)deploy, e.g. deploy-abc1234. Leave empty to build."
+        required: false
+
+concurrency:
+  group: kaneo-deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/codesquad-dk/kaneo
+  ARGOCD_APP: clu1-kaneo
+  OPS_REPO: git@gitlab.codesquad.dk:codesquad/kubernetes-clusters.git
+  OPS_BRANCH: master
+  VALUES_FILE: clu1/kaneo/values.yaml
+
+jobs:
+  build:
+    if: ${{ inputs.tag == '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: echo "tag=deploy-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.kaneo
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [build]
+    if: ${{ always() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || needs.build.outputs.tag }}
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.OPS_REPO_DEPLOY_KEY }}
+
+      - name: Bump image tag in ops repo
+        run: |
+          ssh-keyscan gitlab.codesquad.dk >> ~/.ssh/known_hosts
+          git clone --depth 1 -b "$OPS_BRANCH" "$OPS_REPO" ops
+          cd ops
+          yq -i ".kaneo.image.tag = \"$TAG\"" "$VALUES_FILE"
+          git config user.name  "kaneo-deploy"
+          git config user.email "kaneo-deploy@codesquad.dk"
+          if git diff --quiet; then
+            echo "Tag already $TAG, nothing to commit"
+          else
+            git commit -am "kaneo: deploy $TAG"
+            git push origin "$OPS_BRANCH"
+          fi
+
+      - name: Sync in Argo CD
+        env:
+          ARGOCD_SERVER: argocd.codesquad.dk
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_OPTS: --grpc-web
+        run: |
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          ./argocd app get "$ARGOCD_APP" --refresh > /dev/null
+          ./argocd app sync "$ARGOCD_APP" --prune
+          ./argocd app wait "$ARGOCD_APP" --health --sync --timeout 300
